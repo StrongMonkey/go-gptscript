@@ -17,12 +17,21 @@ import (
 )
 
 var (
+	serverProcessMap map[string]*serverEntry
+
+	lock sync.Mutex
+)
+
+type serverEntry struct {
 	serverProcess       *exec.Cmd
 	serverProcessCancel context.CancelFunc
-	gptscriptCount      int
 	serverURL           string
-	lock                sync.Mutex
-)
+	gptscriptCount      int
+}
+
+func init() {
+	serverProcessMap = make(map[string]*serverEntry)
+}
 
 const relativeToBinaryPath = "<me>"
 
@@ -41,29 +50,35 @@ type GPTScript interface {
 }
 
 type gptscript struct {
-	url string
+	url    string
+	entry  *serverEntry
+	hashID string
 }
 
 func NewGPTScript(opts GlobalOptions) (GPTScript, error) {
 	lock.Lock()
 	defer lock.Unlock()
-	gptscriptCount++
+	if _, ok := serverProcessMap[opts.HashID]; !ok {
+		serverProcessMap[opts.HashID] = &serverEntry{}
+	}
+	serverProcessMap[opts.HashID].gptscriptCount++
+	entry := serverProcessMap[opts.HashID]
 
 	disableServer := os.Getenv("GPTSCRIPT_DISABLE_SERVER") == "true"
 
-	if serverURL == "" && disableServer {
-		serverURL = os.Getenv("GPTSCRIPT_URL")
+	if entry.serverURL == "" && disableServer {
+		entry.serverURL = os.Getenv("GPTSCRIPT_URL")
 	}
 
-	if serverProcessCancel == nil && !disableServer {
-		if serverURL == "" {
+	if entry.serverProcessCancel == nil && !disableServer {
+		if entry.serverURL == "" {
 			l, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				slog.Debug("failed to start gptscript listener", "err", err)
 				return nil, fmt.Errorf("failed to start gptscript: %w", err)
 			}
 
-			serverURL = l.Addr().String()
+			entry.serverURL = l.Addr().String()
 			if err = l.Close(); err != nil {
 				slog.Debug("failed to close gptscript listener", "err", err)
 				return nil, fmt.Errorf("failed to start gptscript: %w", err)
@@ -73,32 +88,33 @@ func NewGPTScript(opts GlobalOptions) (GPTScript, error) {
 		ctx, cancel := context.WithCancel(context.Background())
 
 		in, _ := io.Pipe()
-		serverProcess = exec.CommandContext(ctx, getCommand(), "sys.sdkserver", "--listen-address", serverURL)
+		entry.serverProcess = exec.CommandContext(ctx, getCommand(), "sys.sdkserver", "--listen-address", entry.serverURL)
 		if opts.Env == nil {
 			opts.Env = os.Environ()
 		}
-		serverProcess.Env = append(opts.Env[:], opts.toEnv()...)
-		serverProcess.Stdin = in
+		entry.serverProcess.Env = append(opts.Env[:], opts.toEnv()...)
+		entry.serverProcess.Stdin = in
+		entry.serverProcess.Stdout = os.Stdout
 
-		serverProcessCancel = func() {
+		entry.serverProcessCancel = func() {
 			cancel()
 			_ = in.Close()
 		}
 
-		if err := serverProcess.Start(); err != nil {
-			serverProcessCancel()
+		if err := entry.serverProcess.Start(); err != nil {
+			entry.serverProcessCancel()
 			return nil, fmt.Errorf("failed to start server: %w", err)
 		}
 
 		timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		if err := waitForServerReady(timeoutCtx, serverURL); err != nil {
-			serverProcessCancel()
-			_ = serverProcess.Wait()
+		if err := waitForServerReady(timeoutCtx, entry.serverURL); err != nil {
+			entry.serverProcessCancel()
+			_ = entry.serverProcess.Wait()
 			return nil, fmt.Errorf("failed to wait for gptscript to be ready: %w", err)
 		}
 	}
-	return &gptscript{url: "http://" + serverURL}, nil
+	return &gptscript{url: "http://" + entry.serverURL, entry: entry, hashID: opts.HashID}, nil
 }
 
 func waitForServerReady(ctx context.Context, serverURL string) error {
@@ -125,11 +141,13 @@ func waitForServerReady(ctx context.Context, serverURL string) error {
 func (g *gptscript) Close() {
 	lock.Lock()
 	defer lock.Unlock()
-	gptscriptCount--
+	g.entry.gptscriptCount--
 
-	if gptscriptCount == 0 && serverProcessCancel != nil {
-		serverProcessCancel()
-		_ = serverProcess.Wait()
+	if g.entry.gptscriptCount == 0 && g.entry.serverProcessCancel != nil {
+		g.entry.serverProcessCancel()
+		g.entry.serverProcessCancel = nil
+		_ = g.entry.serverProcess.Wait()
+		delete(serverProcessMap, g.hashID)
 	}
 }
 

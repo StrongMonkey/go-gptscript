@@ -7,6 +7,8 @@ type GlobalOptions struct {
 	OpenAIBaseURL string   `json:"BaseURL"`
 	DefaultModel  string   `json:"DefaultModel"`
 	Env           []string `json:"env"`
+	// HashID is a hash string to separate gptscript run
+	HashID        string   `json:"HashID"`
 }
 
 func (g GlobalOptions) toEnv() []string {
